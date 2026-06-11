@@ -59,7 +59,7 @@ let _cachedProviderName: OCRProviderName | null = null;
 
 export function getOCRProvider(): OCRProvider {
   const providerName = (
-    (process.env.OCR_PROVIDER ?? "mock") as string
+    (process.env.OCR_PROVIDER ?? "ocrspace") as string
   ).toLowerCase().trim() as OCRProviderName;
 
   // Return cache if same provider is still configured
