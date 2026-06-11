@@ -2,100 +2,45 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/scanner
 //
-// Pipeline: Upload → OCR.space → Gemini AI Analysis → Structured Response
+// Pipeline:  Upload → OCR Provider → Gemini AI Analysis → Structured Response
+//
+// Uses the OCR provider abstraction (getOCRProvider) so the underlying engine
+// can be swapped via OCR_PROVIDER env var without touching this file.
 //
 // SECURITY: Requires valid JWT. userId always from JWT, never body.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { NextRequest, NextResponse } from "next/server";
-import { getIdentityFromRequest } from "@/lib/auth-context";
+import { getIdentityFromRequest }   from "@/lib/auth-context";
 import {
   unauthorizedResponse,
   badRequestResponse,
   serverErrorResponse,
 } from "@/lib/auth";
-import { getMedicineAnalyzer } from "@/lib/ai/medicine-analyzer";
+import { getOCRProvider, OCRError, isSupportedMimeType } from "@/lib/ocr";
+import { getMedicineAnalyzer }                            from "@/lib/ai/medicine-analyzer";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 
-const SUPPORTED_MIME_TYPES = [
-  "image/jpeg",
-  "image/jpg",
-  "image/png",
-  "image/webp",
-  "image/heic",
-  "image/heif",
-  "application/pdf",
-] as const;
+// ─── OCR error → HTTP status mapping ─────────────────────────────────────────
 
-function isSupportedMime(mime: string): boolean {
-  return (SUPPORTED_MIME_TYPES as readonly string[]).includes(mime.toLowerCase());
-}
-
-// ─── OCR via OCR.space ────────────────────────────────────────────────────────
-
-async function runOcrSpace(
-  imageBuffer: Buffer,
-  mimeType: string
-): Promise<{ rawText: string; confidence: number }> {
-  const apiKey = process.env.OCR_SPACE_API_KEY ?? "helloworld";
-
-  const formData = new FormData();
-  formData.append("apikey", apiKey);
-  formData.append("language", "eng");
-  formData.append("isOverlayRequired", "false");
-  formData.append("detectOrientation", "true");
-  formData.append("scale", "true");
-  formData.append("OCREngine", "2");
-
-  const ext = mimeType.includes("pdf") ? "pdf" : mimeType.split("/")[1].replace("jpeg", "jpg");
-  const blob = new Blob([new Uint8Array(imageBuffer)], { type: mimeType });
-  formData.append("file", blob, `prescription.${ext}`);
-  formData.append("file", blob, `prescription.${ext}`);
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
-
-  let res: Response;
-  try {
-    res = await fetch("https://api.ocr.space/parse/image", {
-      method: "POST",
-      body: formData,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
+function ocrErrorToStatus(err: OCRError): number {
+  switch (err.code) {
+    case "IMAGE_TOO_LARGE":    return 413;
+    case "UNSUPPORTED_FORMAT": return 415;
+    case "TIMEOUT":            return 504;
+    case "LOW_QUALITY":        return 422;
+    default:                   return 422;
   }
-
-  if (!res.ok) {
-    throw new Error(`OCR.space HTTP ${res.status}`);
-  }
-
-  const json: any = await res.json();
-
-  if (json.IsErroredOnProcessing) {
-    throw new Error(json.ErrorMessage?.[0] ?? "OCR processing error");
-  }
-
-  const parsed: any[] = json.ParsedResults ?? [];
-  if (!parsed.length) {
-    throw new Error("OCR returned no results");
-  }
-
-  const rawText = parsed.map((r: any) => r.ParsedText ?? "").join("\n").trim();
-  const exitCode: number = parsed[0]?.FileParseExitCode ?? 1;
-  const confidence = exitCode === 1 ? 0.92 : exitCode === 2 ? 0.70 : 0.50;
-
-  return { rawText, confidence };
 }
 
 // ─── Route Handler ────────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
   const scanStart = Date.now();
-  const scanId = `scan_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const scanId    = `scan_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
   // 1. Auth
   const identity = getIdentityFromRequest(request);
@@ -129,8 +74,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
-  const mimeType = file.type?.toLowerCase() ?? "image/jpeg";
-  if (!isSupportedMime(mimeType)) {
+  const mimeType = (file.type?.toLowerCase() ?? "image/jpeg") as string;
+  if (!isSupportedMimeType(mimeType)) {
     return badRequestResponse(
       `Unsupported file type "${mimeType}". Accepted: JPEG, PNG, WEBP, HEIC, PDF.`,
       "UNSUPPORTED_MIME"
@@ -141,18 +86,35 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   const arrayBuffer = await file.arrayBuffer();
   const imageBuffer = Buffer.from(arrayBuffer);
 
-  // 4. OCR
+  // 4. OCR via the configured provider
+  const ocrProvider = getOCRProvider();
   let ocrResult: { rawText: string; confidence: number };
+
   try {
-    ocrResult = await runOcrSpace(imageBuffer, mimeType);
-  } catch (err: any) {
-    console.error(`[scanner] OCR failed for user ${userId} (${scanId}):`, err.message);
+    const result = await ocrProvider.extractText(imageBuffer, mimeType);
+    ocrResult = { rawText: result.rawText, confidence: result.confidence };
+  } catch (err) {
+    console.error(`[scanner] OCR failed user=${userId} scanId=${scanId}:`, err);
+
+    if (err instanceof OCRError) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            message: `OCR processing failed: ${err.message}`,
+            code:    err.code,
+          },
+        },
+        { status: ocrErrorToStatus(err) }
+      );
+    }
+
     return NextResponse.json(
       {
         success: false,
         error: {
-          message: `OCR processing failed: ${err.message}`,
-          code: "OCR_FAILED",
+          message: "OCR processing failed. Please try again with a clearer image.",
+          code:    "OCR_FAILED",
         },
       },
       { status: 422 }
@@ -164,8 +126,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       {
         success: false,
         error: {
-          message: "Could not extract any text from the image. Please try a clearer photo.",
-          code: "NO_TEXT_EXTRACTED",
+          message: "Could not extract any text from the image. Please try a clearer photo with good lighting.",
+          code:    "NO_TEXT_EXTRACTED",
         },
       },
       { status: 422 }
@@ -175,36 +137,39 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   // 5. AI Medicine Analysis via Gemini
   const analyzer = getMedicineAnalyzer();
   let aiAnalysis;
+
   try {
     aiAnalysis = await analyzer.analyze(ocrResult.rawText);
-  } catch (err: any) {
-    console.error(`[scanner] AI analysis failed for user ${userId} (${scanId}):`, err.message);
-    // Degrade gracefully — return OCR text without AI analysis
+  } catch (err) {
+    console.error(`[scanner] AI analysis failed user=${userId} scanId=${scanId}:`, err);
+
+    // Degrade gracefully: return OCR text without AI analysis so the user
+    // can still manually verify and add the medicine.
     aiAnalysis = {
-      medicineName: null,
-      normalizedMedicineName: null,
-      genericName: null,
-      dosage: null,
-      frequency: null,
-      frequencyCode: "once_daily",
-      duration: null,
-      prescribedBy: null,
-      instructions: null,
-      warnings: [],
-      category: null,
-      confidence: ocrResult.confidence * 0.5,
-      ocrCorrectionsMade: false,
-      rawAnalysis: `AI analysis unavailable: ${err.message}`,
+      medicineName:            null,
+      normalizedMedicineName:  null,
+      genericName:             null,
+      dosage:                  null,
+      frequency:               null,
+      frequencyCode:           "once_daily",
+      duration:                null,
+      prescribedBy:            null,
+      instructions:            null,
+      warnings:                ["AI analysis unavailable — please verify all fields manually."],
+      category:                null,
+      confidence:              ocrResult.confidence * 0.5,
+      ocrCorrectionsMade:      false,
+      rawAnalysis:             err instanceof Error ? err.message : "AI analysis error",
     };
   }
 
   const totalProcessingTimeMs = Date.now() - scanStart;
 
   console.info(
-    `[scanner] ${scanId} user=${userId} ` +
-      `ocrConfidence=${ocrResult.confidence} aiConfidence=${aiAnalysis.confidence} ` +
-      `medicine=${aiAnalysis.normalizedMedicineName ?? "unknown"} ` +
-      `totalMs=${totalProcessingTimeMs}`
+    `[scanner] ${scanId} user=${userId} provider=${ocrProvider.name} ` +
+    `ocrConf=${ocrResult.confidence.toFixed(2)} aiConf=${aiAnalysis.confidence.toFixed(2)} ` +
+    `medicine=${aiAnalysis.normalizedMedicineName ?? "unknown"} ` +
+    `ms=${totalProcessingTimeMs}`
   );
 
   // 6. Return combined result
@@ -212,13 +177,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     success: true,
     data: {
       scanId,
-      // OCR data
-      rawText: ocrResult.rawText,
-      ocrConfidence: ocrResult.confidence,
-      ocrProvider: "ocr_space",
-      // AI analysis
+      rawText:         ocrResult.rawText,
+      ocrConfidence:   ocrResult.confidence,
+      ocrProvider:     ocrProvider.name,
       aiAnalysis,
-      // Combined confidence (weighted average)
       overallConfidence: Math.round(
         (ocrResult.confidence * 0.4 + aiAnalysis.confidence * 0.6) * 100
       ) / 100,
@@ -233,7 +195,7 @@ export async function GET(): Promise<NextResponse> {
       success: false,
       error: {
         message: "Use POST /api/scanner to submit an image for scanning.",
-        code: "METHOD_NOT_ALLOWED",
+        code:    "METHOD_NOT_ALLOWED",
       },
     },
     { status: 405 }

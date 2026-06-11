@@ -3,65 +3,69 @@
 // Medicine Analyzer — uses Google Gemini to extract structured medicine data
 // from raw OCR text.
 //
-// Input:  raw OCR text from a prescription or medicine package
-// Output: structured medicine data with confidence score
+// This module is always Gemini-based regardless of AI_PROVIDER because the
+// structured JSON extraction prompt is tuned specifically for Gemini's output
+// format. The chat assistant (AI_PROVIDER) is a separate concern.
 //
-// Env:  GEMINI_API_KEY  (required)
+// CONFIGURATION
+//   GEMINI_API_KEY           Required
+//   GEMINI_ANALYZER_MODEL    Optional — default: gemini-2.0-flash
+//   GEMINI_ANALYZER_TIMEOUT  Optional — default: 30000 (ms)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface MedicineAnalysisResult {
-  medicineName: string | null;
-  normalizedMedicineName: string | null;
-  genericName: string | null;
-  dosage: string | null;
-  frequency: string | null;
-  frequencyCode: string | null; // maps to FREQUENCY_VALUES enum
-  duration: string | null;
-  prescribedBy: string | null;
-  instructions: string | null;
-  warnings: string[];
-  category: string | null;
-  confidence: number; // 0–1
-  ocrCorrectionsMade: boolean;
-  rawAnalysis: string; // full LLM response for debugging
+  medicineName:            string | null;
+  normalizedMedicineName:  string | null;
+  genericName:             string | null;
+  dosage:                  string | null;
+  frequency:               string | null;
+  frequencyCode:           string | null;
+  duration:                string | null;
+  prescribedBy:            string | null;
+  instructions:            string | null;
+  warnings:                string[];
+  category:                string | null;
+  confidence:              number;
+  ocrCorrectionsMade:      boolean;
+  rawAnalysis:             string;
 }
 
 export interface MedicineAnalyzerOptions {
-  apiKey?: string;
-  model?: string;
+  apiKey?:    string;
+  model?:     string;
   timeoutMs?: number;
 }
 
-// ─── Frequency normalizer ─────────────────────────────────────────────────────
+// ─── Frequency normaliser ─────────────────────────────────────────────────────
 
 const FREQUENCY_MAP: Record<string, string> = {
-  "once daily": "once_daily",
-  "once a day": "once_daily",
-  "1x daily": "once_daily",
-  "qd": "once_daily",
-  "every day": "once_daily",
-  "twice daily": "twice_daily",
-  "twice a day": "twice_daily",
-  "2x daily": "twice_daily",
-  "bid": "twice_daily",
-  "b.i.d": "twice_daily",
-  "three times daily": "three_times_daily",
-  "three times a day": "three_times_daily",
-  "3x daily": "three_times_daily",
-  "tid": "three_times_daily",
-  "t.i.d": "three_times_daily",
-  "four times daily": "four_times_daily",
-  "four times a day": "four_times_daily",
-  "4x daily": "four_times_daily",
-  "qid": "four_times_daily",
-  "every other day": "every_other_day",
-  "alternate days": "every_other_day",
-  "eod": "every_other_day",
-  "weekly": "weekly",
-  "once a week": "weekly",
-  "as needed": "as_needed",
-  "prn": "as_needed",
-  "when needed": "as_needed",
+  "once daily":           "once_daily",
+  "once a day":           "once_daily",
+  "1x daily":             "once_daily",
+  "qd":                   "once_daily",
+  "every day":            "once_daily",
+  "twice daily":          "twice_daily",
+  "twice a day":          "twice_daily",
+  "2x daily":             "twice_daily",
+  "bid":                  "twice_daily",
+  "b.i.d":                "twice_daily",
+  "three times daily":    "three_times_daily",
+  "three times a day":    "three_times_daily",
+  "3x daily":             "three_times_daily",
+  "tid":                  "three_times_daily",
+  "t.i.d":                "three_times_daily",
+  "four times daily":     "four_times_daily",
+  "four times a day":     "four_times_daily",
+  "4x daily":             "four_times_daily",
+  "qid":                  "four_times_daily",
+  "every other day":      "every_other_day",
+  "alternate days":       "every_other_day",
+  "eod":                  "every_other_day",
+  "weekly":               "weekly",
+  "once a week":          "weekly",
+  "as needed":            "as_needed",
+  "prn":                  "as_needed",
+  "when needed":          "as_needed",
 };
 
 function normalizeFrequency(freq: string | null): string | null {
@@ -70,10 +74,10 @@ function normalizeFrequency(freq: string | null): string | null {
   for (const [key, val] of Object.entries(FREQUENCY_MAP)) {
     if (lower.includes(key)) return val;
   }
-  return "once_daily"; // safe default
+  return "once_daily";
 }
 
-// ─── Prompt builder ───────────────────────────────────────────────────────────
+// ─── Extraction prompt ────────────────────────────────────────────────────────
 
 function buildPrompt(ocrText: string): string {
   return `You are a pharmaceutical data extraction expert. Analyze the following OCR text extracted from a prescription label or medicine package and extract structured medicine information.
@@ -94,7 +98,7 @@ Instructions:
 8. Determine the medicine category (e.g., "Antibiotic", "Antidiabetic", "ACE Inhibitor", "Statin", "NSAID", "Supplement")
 9. Set confidence between 0.0 and 1.0 based on how clearly the information was extractable
 
-Return ONLY a valid JSON object with NO markdown, NO code blocks, NO extra text. Just the raw JSON:
+Return ONLY a valid JSON object with NO markdown, NO code blocks, NO extra text:
 
 {
   "medicineName": "string or null",
@@ -112,152 +116,159 @@ Return ONLY a valid JSON object with NO markdown, NO code blocks, NO extra text.
 }`;
 }
 
+// ─── JSON extraction helper ───────────────────────────────────────────────────
+
+function extractJSON(text: string): Record<string, unknown> | null {
+  // 1. Try direct parse (Gemini should return clean JSON per the prompt)
+  try {
+    const clean = text
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```\s*$/, "")
+      .trim();
+    return JSON.parse(clean) as Record<string, unknown>;
+  } catch { /* fall through */ }
+
+  // 2. Regex extraction as fallback
+  const match = text.match(/\{[\s\S]+\}/);
+  if (match) {
+    try {
+      return JSON.parse(match[0]) as Record<string, unknown>;
+    } catch { /* fall through */ }
+  }
+
+  return null;
+}
+
 // ─── Main analyzer class ──────────────────────────────────────────────────────
 
 export class MedicineAnalyzer {
-  private readonly apiKey: string;
-  private readonly model: string;
+  private readonly apiKey:    string;
+  private readonly model:     string;
   private readonly timeoutMs: number;
 
   constructor(options: MedicineAnalyzerOptions = {}) {
-    this.apiKey =
-      options.apiKey ??
-      process.env.GEMINI_API_KEY ??
-      "";
-    this.model = options.model ?? "gemini-2.0-flash";
-    this.timeoutMs = options.timeoutMs ?? 30_000;
-
-    if (!this.apiKey) {
-      console.warn("[MedicineAnalyzer] GEMINI_API_KEY not set — analysis will fail");
+    const apiKey = options.apiKey ?? process.env.GEMINI_API_KEY ?? "";
+    if (!apiKey) {
+      throw new Error(
+        "[MedicineAnalyzer] GEMINI_API_KEY is not set. " +
+        "The prescription scanner requires a valid Gemini API key."
+      );
     }
+    this.apiKey    = apiKey;
+    this.model     = options.model     ?? process.env.GEMINI_ANALYZER_MODEL ?? "gemini-2.0-flash";
+    this.timeoutMs = options.timeoutMs ?? parseInt(process.env.GEMINI_ANALYZER_TIMEOUT ?? "30000", 10);
   }
 
   async analyze(ocrText: string): Promise<MedicineAnalysisResult> {
-    if (!this.apiKey) {
-      throw new Error("GEMINI_API_KEY is not configured");
-    }
-
     if (!ocrText?.trim()) {
       return this._emptyResult("No OCR text provided");
     }
 
-    const prompt = buildPrompt(ocrText);
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/${this.model}` +
+      `:generateContent?key=${this.apiKey}`;
 
-    // Call Gemini REST API
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), this.timeoutMs);
 
     let response: Response;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
       response = await fetch(url, {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [{ text: prompt }],
-            },
-          ],
+        body:    JSON.stringify({
+          contents: [{ parts: [{ text: buildPrompt(ocrText) }] }],
           generationConfig: {
-            temperature: 0.1, // low temperature for structured extraction
+            temperature:     0.1,
             maxOutputTokens: 1024,
           },
         }),
         signal: controller.signal,
       });
+    } catch (err: unknown) {
       clearTimeout(timer);
-    } catch (err: any) {
-      if (err?.name === "AbortError") {
-        throw new Error("Gemini API request timed out");
+      const msg = err instanceof Error ? err.message : "unknown";
+      if ((err as { name?: string })?.name === "AbortError") {
+        throw new Error(`Gemini analyzer timed out after ${this.timeoutMs}ms`);
       }
-      throw new Error(`Gemini API network error: ${err?.message ?? "unknown"}`);
+      throw new Error(`Gemini analyzer network error: ${msg}`);
+    } finally {
+      clearTimeout(timer);
     }
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new Error(`Gemini API error ${response.status}: ${body}`);
+      throw new Error(`Gemini analyzer HTTP ${response.status}: ${body.slice(0, 200)}`);
     }
 
-    let geminiData: any;
+    let geminiData: {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      error?:      { message?: string };
+    };
     try {
       geminiData = await response.json();
     } catch {
-      throw new Error("Gemini API returned invalid JSON");
+      throw new Error("Gemini analyzer returned non-JSON response");
     }
 
-    const rawText: string =
-      geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    if (geminiData.error?.message) {
+      throw new Error(`Gemini analyzer error: ${geminiData.error.message}`);
+    }
 
+    const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
     if (!rawText) {
       return this._emptyResult("Gemini returned empty response");
     }
 
-    // Parse the JSON out of the response
-    let parsed: any;
-    try {
-      // Strip markdown code blocks if present (defensive)
-      const cleaned = rawText
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```\s*$/, "")
-        .trim();
-      parsed = JSON.parse(cleaned);
-    } catch {
-      // If JSON parse fails, try to extract JSON object from text
-      const jsonMatch = rawText.match(/\{[\s\S]+\}/);
-      if (jsonMatch) {
-        try {
-          parsed = JSON.parse(jsonMatch[0]);
-        } catch {
-          return this._emptyResult("Could not parse Gemini response as JSON");
-        }
-      } else {
-        return this._emptyResult("Gemini response contained no JSON");
-      }
+    const parsed = extractJSON(rawText);
+    if (!parsed) {
+      return this._emptyResult("Could not parse Gemini response as JSON");
     }
 
+    const confidence = typeof parsed.confidence === "number"
+      ? Math.min(1, Math.max(0, parsed.confidence))
+      : 0.5;
+
     return {
-      medicineName: parsed.medicineName ?? null,
-      normalizedMedicineName: parsed.normalizedMedicineName ?? parsed.medicineName ?? null,
-      genericName: parsed.genericName ?? null,
-      dosage: parsed.dosage ?? null,
-      frequency: parsed.frequency ?? null,
-      frequencyCode: normalizeFrequency(parsed.frequency),
-      duration: parsed.duration ?? null,
-      prescribedBy: parsed.prescribedBy ?? null,
-      instructions: parsed.instructions ?? null,
-      warnings: Array.isArray(parsed.warnings) ? parsed.warnings : [],
-      category: parsed.category ?? null,
-      confidence: typeof parsed.confidence === "number"
-        ? Math.min(1, Math.max(0, parsed.confidence))
-        : 0.5,
-      ocrCorrectionsMade: parsed.ocrCorrectionsMade === true,
-      rawAnalysis: rawText,
+      medicineName:           (parsed.medicineName           as string | null) ?? null,
+      normalizedMedicineName: (parsed.normalizedMedicineName as string | null) ?? (parsed.medicineName as string | null) ?? null,
+      genericName:            (parsed.genericName            as string | null) ?? null,
+      dosage:                 (parsed.dosage                 as string | null) ?? null,
+      frequency:              (parsed.frequency              as string | null) ?? null,
+      frequencyCode:          normalizeFrequency((parsed.frequency as string | null) ?? null),
+      duration:               (parsed.duration               as string | null) ?? null,
+      prescribedBy:           (parsed.prescribedBy           as string | null) ?? null,
+      instructions:           (parsed.instructions           as string | null) ?? null,
+      warnings:               Array.isArray(parsed.warnings) ? (parsed.warnings as string[]) : [],
+      category:               (parsed.category               as string | null) ?? null,
+      confidence,
+      ocrCorrectionsMade:     parsed.ocrCorrectionsMade === true,
+      rawAnalysis:            rawText,
     };
   }
 
   private _emptyResult(reason: string): MedicineAnalysisResult {
     console.warn("[MedicineAnalyzer] Empty result:", reason);
     return {
-      medicineName: null,
-      normalizedMedicineName: null,
-      genericName: null,
-      dosage: null,
-      frequency: null,
-      frequencyCode: null,
-      duration: null,
-      prescribedBy: null,
-      instructions: null,
-      warnings: [],
-      category: null,
-      confidence: 0,
-      ocrCorrectionsMade: false,
-      rawAnalysis: reason,
+      medicineName:            null,
+      normalizedMedicineName:  null,
+      genericName:             null,
+      dosage:                  null,
+      frequency:               null,
+      frequencyCode:           null,
+      duration:                null,
+      prescribedBy:            null,
+      instructions:            null,
+      warnings:                [],
+      category:                null,
+      confidence:              0,
+      ocrCorrectionsMade:      false,
+      rawAnalysis:             reason,
     };
   }
 }
 
-// ─── Singleton ────────────────────────────────────────────────────────────────
+// ─── Singleton factory ────────────────────────────────────────────────────────
 
 let _analyzerInstance: MedicineAnalyzer | null = null;
 
@@ -266,4 +277,9 @@ export function getMedicineAnalyzer(): MedicineAnalyzer {
     _analyzerInstance = new MedicineAnalyzer();
   }
   return _analyzerInstance;
+}
+
+/** Reset the singleton — useful in tests. */
+export function resetMedicineAnalyzer(): void {
+  _analyzerInstance = null;
 }
